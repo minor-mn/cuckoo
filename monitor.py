@@ -205,6 +205,7 @@ class XClient:
         *,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
+        since_id: str | None = None,
     ) -> dict[str, Any]:
         params: dict[str, str | int] = {
             "max_results": 5,
@@ -217,14 +218,21 @@ class XClient:
             params["start_time"] = format_api_datetime(start_time)
         if end_time:
             params["end_time"] = format_api_datetime(end_time)
+        if since_id:
+            params["since_id"] = since_id
         return self._request("GET", f"/2/users/{user_id}/tweets", params=params)
 
     def get_posts_for_local_date(
-        self, user_id: str, local_today: date, tz: ZoneInfo
-    ) -> list[dict[str, Any]]:
+        self,
+        user_id: str,
+        local_today: date,
+        tz: ZoneInfo,
+        since_id: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
         """Fetch only today's posts, five posts per page."""
         posts: list[dict[str, Any]] = []
         pagination_token: str | None = None
+        newest_id: str | None = None
         start_time = datetime.combine(local_today, datetime_time.min, tzinfo=tz)
         end_time = datetime.now(tz)
 
@@ -234,17 +242,24 @@ class XClient:
                 pagination_token,
                 start_time=start_time,
                 end_time=end_time,
+                since_id=since_id,
             )
             page = response.get("data", [])
             posts.extend(page)
             if not page:
                 break
 
-            pagination_token = response.get("meta", {}).get("next_token")
+            metadata = response.get("meta", {})
+            if newest_id is None:
+                newest_id_value = metadata.get("newest_id")
+                if newest_id_value:
+                    newest_id = str(newest_id_value)
+
+            pagination_token = metadata.get("next_token")
             if not pagination_token:
                 break
 
-        return posts
+        return posts, newest_id
 
     def create_post(self, text: str) -> dict[str, Any]:
         response = self._request("POST", "/2/tweets", body={"text": text})
@@ -413,11 +428,18 @@ def run(config_path: Path, dry_run: bool = False) -> int:
 
         if state.get("date") == today_string and state.get("source_post_id"):
             LOG.info(
-                "Already copied today's matching post %s; target=%s",
+                "Already posted today's summary for source post %s; target=%s",
                 state["source_post_id"],
                 target_username,
             )
             return 0
+
+        is_dry_run = dry_run or bool(system_config.get("dry_run", False))
+        since_id = None
+        if state.get("date") == today_string:
+            saved_since_id = state.get("last_seen_source_post_id")
+            if saved_since_id:
+                since_id = str(saved_since_id)
 
         client = XClient(
             consumer_key,
@@ -432,7 +454,12 @@ def run(config_path: Path, dry_run: bool = False) -> int:
             source_user_id = str(source_user["id"])
             LOG.info("Monitoring @%s (user id %s)", source_user["username"], source_user_id)
 
-        posts = client.get_posts_for_local_date(source_user_id, today, tz)
+        posts, newest_source_post_id = client.get_posts_for_local_date(
+            source_user_id,
+            today,
+            tz,
+            since_id=since_id,
+        )
         candidate = find_first_matching_post(
             posts,
             local_today=today,
@@ -442,6 +469,14 @@ def run(config_path: Path, dry_run: bool = False) -> int:
         )
         if candidate is None:
             LOG.info("No matching post for %s", today_string)
+            if newest_source_post_id and not is_dry_run:
+                save_state(
+                    state_path,
+                    {
+                        "date": today_string,
+                        "last_seen_source_post_id": newest_source_post_id,
+                    },
+                )
             return 0
 
         candidate_id = str(candidate["id"])
@@ -459,7 +494,7 @@ def run(config_path: Path, dry_run: bool = False) -> int:
         )
         post_text = render_post_text(post_text_template, today)
         LOG.info("Post text: %s", post_text)
-        if dry_run or bool(system_config.get("dry_run", False)):
+        if is_dry_run:
             LOG.info("Dry run; no post created")
             return 0
 
