@@ -1,0 +1,6 @@
+config.toml
+state.json
+.*.lock
+monitor.log
+__pycache__/
+.pytest_cache/
