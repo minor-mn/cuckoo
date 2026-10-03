@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copy the first matching Hanshin Tigers post of each day.
+"""Post a configured daily message and follow new followers.
 
 The script is intentionally dependency-free so it can run directly from cron.
 It uses the X API v2 with OAuth 1.0a credentials belonging to the target account.
@@ -20,7 +20,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from datetime import date, datetime, time as datetime_time, timezone
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -30,8 +30,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 LOG = logging.getLogger("x-post-monitor")
-DEFAULT_KEYWORD_1 = "【 一軍 】"
-DEFAULT_KEYWORD_2 = "【 阪神 】"
 DEFAULT_POST_TEXT = "yyyy.mm.dd 阪神戦まとめ"
 
 
@@ -42,16 +40,6 @@ class XApiError(RuntimeError):
 def oauth_percent_encode(value: str | int) -> str:
     """Encode a value according to RFC 5849's OAuth encoding rules."""
     return quote(str(value), safe="~-._")
-
-
-def format_api_datetime(value: datetime) -> str:
-    """Format an aware datetime as an RFC 3339 UTC timestamp."""
-    return (
-        value.astimezone(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
 
 
 def oauth1_authorization_header(
@@ -127,12 +115,14 @@ class XClient:
         access_token: str,
         access_token_secret: str,
         base_url: str = "https://api.x.com",
+        bearer_token: str = "",
     ) -> None:
         self.consumer_key = consumer_key
         self.consumer_secret = consumer_secret
         self.access_token = access_token
         self.access_token_secret = access_token_secret
         self.base_url = base_url.rstrip("/")
+        self.bearer_token = bearer_token
 
     def _request(
         self,
@@ -141,14 +131,19 @@ class XClient:
         *,
         params: dict[str, str | int] | None = None,
         body: dict[str, Any] | None = None,
+        bearer: bool = False,
     ) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
         if params:
             url = f"{url}?{urlencode(params)}"
 
         data = json.dumps(body).encode("utf-8") if body is not None else None
-        headers = {
-            "Authorization": oauth1_authorization_header(
+        if bearer:
+            if not self.bearer_token:
+                raise XApiError("A bearer token is required for this X API lookup")
+            authorization = f"Bearer {self.bearer_token}"
+        else:
+            authorization = oauth1_authorization_header(
                 method,
                 url,
                 consumer_key=self.consumer_key,
@@ -157,7 +152,9 @@ class XClient:
                 access_token_secret=self.access_token_secret,
                 timestamp=str(int(time.time())),
                 nonce=secrets.token_hex(16),
-            ),
+            )
+        headers = {
+            "Authorization": authorization,
             "Accept": "application/json",
             "User-Agent": "hanshin-post-monitor/1.0",
         }
@@ -186,80 +183,33 @@ class XClient:
             raise XApiError(f"X API returned errors: {payload['errors']}")
         return payload
 
-    def get_user(self, username: str) -> dict[str, Any]:
-        encoded_username = quote(username.lstrip("@"), safe="")
-        response = self._request(
-            "GET",
-            f"/2/users/by/username/{encoded_username}",
-            params={"user.fields": "id,username"},
-        )
+    def get_authenticated_user(self) -> dict[str, Any]:
+        response = self._request("GET", "/2/users/me", params={"user.fields": "id,username"})
         try:
             return response["data"]
         except KeyError as error:
-            raise XApiError(f"X API did not return a user for @{username}") from error
+            raise XApiError(f"X API did not return the authenticated user: {response}") from error
 
-    def get_timeline_page(
-        self,
-        user_id: str,
-        pagination_token: str | None = None,
-        *,
-        start_time: datetime | None = None,
-        end_time: datetime | None = None,
-        since_id: str | None = None,
+    def get_followers_page(
+        self, user_id: str, pagination_token: str | None = None
     ) -> dict[str, Any]:
         params: dict[str, str | int] = {
-            "max_results": 5,
-            "exclude": "retweets,replies",
-            "tweet.fields": "created_at,text",
+            "max_results": 1000,
+            "user.fields": "id,username",
         }
         if pagination_token:
             params["pagination_token"] = pagination_token
-        if start_time:
-            params["start_time"] = format_api_datetime(start_time)
-        if end_time:
-            params["end_time"] = format_api_datetime(end_time)
-        if since_id:
-            params["since_id"] = since_id
-        return self._request("GET", f"/2/users/{user_id}/tweets", params=params)
+        return self._request(
+            "GET", f"/2/users/{user_id}/followers", params=params, bearer=True
+        )
 
-    def get_posts_for_local_date(
-        self,
-        user_id: str,
-        local_today: date,
-        tz: ZoneInfo,
-        since_id: str | None = None,
-    ) -> tuple[list[dict[str, Any]], str | None]:
-        """Fetch only today's posts, five posts per page."""
-        posts: list[dict[str, Any]] = []
-        pagination_token: str | None = None
-        newest_id: str | None = None
-        start_time = datetime.combine(local_today, datetime_time.min, tzinfo=tz)
-        end_time = datetime.now(tz)
-
-        while True:
-            response = self.get_timeline_page(
-                user_id,
-                pagination_token,
-                start_time=start_time,
-                end_time=end_time,
-                since_id=since_id,
-            )
-            page = response.get("data", [])
-            posts.extend(page)
-            if not page:
-                break
-
-            metadata = response.get("meta", {})
-            if newest_id is None:
-                newest_id_value = metadata.get("newest_id")
-                if newest_id_value:
-                    newest_id = str(newest_id_value)
-
-            pagination_token = metadata.get("next_token")
-            if not pagination_token:
-                break
-
-        return posts, newest_id
+    def follow_user(self, source_user_id: str, target_user_id: str) -> dict[str, Any]:
+        response = self._request(
+            "POST",
+            f"/2/users/{source_user_id}/following",
+            body={"target_user_id": target_user_id},
+        )
+        return response.get("data", {})
 
     def create_post(self, text: str) -> dict[str, Any]:
         response = self._request("POST", "/2/tweets", body={"text": text})
@@ -269,11 +219,6 @@ class XClient:
             raise XApiError(f"X API did not return the created post: {response}") from error
 
 
-def parse_created_at(value: str) -> datetime:
-    """Parse the RFC 3339 timestamp returned by the X API."""
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
 def render_post_text(template: str, local_date: date) -> str:
     """Render the supported date tokens in the configured post template."""
     return (
@@ -281,27 +226,6 @@ def render_post_text(template: str, local_date: date) -> str:
         .replace("mm", f"{local_date.month:02d}")
         .replace("dd", f"{local_date.day:02d}")
     )
-
-
-def find_first_matching_post(
-    posts: list[dict[str, Any]],
-    *,
-    local_today: date,
-    tz: ZoneInfo,
-    keyword_1: str,
-    keyword_2: str,
-) -> dict[str, Any] | None:
-    matching: list[dict[str, Any]] = []
-    for post in posts:
-        text = post.get("text", "")
-        created_at_value = post.get("created_at")
-        if not created_at_value or keyword_1 not in text or keyword_2 not in text:
-            continue
-        created_at = parse_created_at(created_at_value)
-        if created_at.astimezone(tz).date() == local_today:
-            matching.append(post)
-
-    return min(matching, key=lambda post: parse_created_at(post["created_at"])) if matching else None
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -337,6 +261,63 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
                 os.unlink(temporary_path)
             except FileNotFoundError:
                 pass
+
+
+def follow_new_followers(
+    client: XClient,
+    *,
+    target_user_id: str,
+    today_string: str,
+    followers_path: Path,
+) -> None:
+    follower_state = load_state(followers_path)
+    if follower_state.get("date") == today_string:
+        return
+
+    saved_ids = follower_state.get("user_ids")
+    if saved_ids is None:
+        # Establish a baseline without following everybody already present.
+        all_ids: list[str] = []
+        pagination_token: str | None = None
+        while True:
+            response = client.get_followers_page(target_user_id, pagination_token)
+            all_ids.extend(str(user["id"]) for user in response.get("data", []))
+            pagination_token = response.get("meta", {}).get("next_token")
+            if not pagination_token:
+                break
+        save_state(followers_path, {"date": today_string, "user_ids": all_ids})
+        LOG.info("Saved initial follower baseline: %d users", len(all_ids))
+        return
+
+    if not isinstance(saved_ids, list) or not all(isinstance(user_id, str) for user_id in saved_ids):
+        raise RuntimeError(f"Follower state file {followers_path} has an invalid user_ids value")
+
+    known_ids = set(saved_ids)
+    new_ids: list[str] = []
+    pagination_token = None
+    found_known_id = False
+    while not found_known_id:
+        response = client.get_followers_page(target_user_id, pagination_token)
+        for user in response.get("data", []):
+            user_id = str(user["id"])
+            if user_id in known_ids:
+                found_known_id = True
+                break
+            new_ids.append(user_id)
+            result = client.follow_user(target_user_id, user_id)
+            LOG.info("Followed new follower %s (following=%s)", user_id, result.get("following"))
+        if found_known_id:
+            break
+        pagination_token = response.get("meta", {}).get("next_token")
+        if not pagination_token:
+            break
+
+    save_state(
+        followers_path,
+        {"date": today_string, "user_ids": new_ids + saved_ids},
+    )
+    if new_ids:
+        LOG.info("Followed %d new followers", len(new_ids))
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -387,23 +368,20 @@ def parse_args() -> argparse.Namespace:
 def run(config_path: Path, dry_run: bool = False) -> int:
     config = load_config(config_path)
     auth_config = config_section(config, "auth")
-    source_config = config_section(config, "source")
     target_config = config_section(config, "target")
-    matching_config = config_section(config, "matching")
     system_config = config_section(config, "system")
 
     consumer_key = required_config(auth_config, "consumer_key")
     consumer_secret = required_config(auth_config, "consumer_secret")
     access_token = required_config(auth_config, "access_token")
     access_token_secret = required_config(auth_config, "access_token_secret")
-    source_username = str(source_config.get("username", "hanshintigersjp")).strip()
+    bearer_token = str(auth_config.get("bearer_token", "")).strip()
     target_username = str(target_config.get("username", "tigerslivecom")).strip().lstrip("@")
     post_text_template = target_config.get("post_text", DEFAULT_POST_TEXT)
     if not isinstance(post_text_template, str) or not post_text_template:
         raise RuntimeError("Config value must be a non-empty string: target.post_text")
-    keyword_1 = str(matching_config.get("keyword_1", DEFAULT_KEYWORD_1))
-    keyword_2 = str(matching_config.get("keyword_2", DEFAULT_KEYWORD_2))
     state_path = Path(str(system_config.get("state_file", "state.json")))
+    followers_path = Path(str(system_config.get("followers_file", "followers.json")))
     api_base_url = str(system_config.get("api_base_url", "https://api.x.com"))
     timezone_name = str(system_config.get("timezone", "Asia/Tokyo"))
 
@@ -422,76 +400,57 @@ def run(config_path: Path, dry_run: bool = False) -> int:
             return 0
 
         state = load_state(state_path)
+        follower_state = load_state(followers_path)
         now = datetime.now(tz)
         today = now.date()
         today_string = today.isoformat()
-
-        if state.get("date") == today_string and state.get("source_post_id"):
-            LOG.info(
-                "Already posted today's summary for source post %s; target=%s",
-                state["source_post_id"],
-                target_username,
-            )
-            return 0
-
         is_dry_run = dry_run or bool(system_config.get("dry_run", False))
-        since_id = None
-        if state.get("date") == today_string:
-            saved_since_id = state.get("last_seen_source_post_id")
-            if saved_since_id:
-                since_id = str(saved_since_id)
+        should_check_followers = follower_state.get("date") != today_string
 
-        client = XClient(
-            consumer_key,
-            consumer_secret,
-            access_token,
-            access_token_secret,
-            api_base_url,
-        )
-        source_user_id = str(source_config.get("user_id", "")).strip()
-        if not source_user_id:
-            source_user = client.get_user(source_username)
-            source_user_id = str(source_user["id"])
-            LOG.info("Monitoring @%s (user id %s)", source_user["username"], source_user_id)
+        if state.get("date") == today_string and state.get("target_post_id"):
+            already_posted = True
+        else:
+            already_posted = False
 
-        posts, newest_source_post_id = client.get_posts_for_local_date(
-            source_user_id,
-            today,
-            tz,
-            since_id=since_id,
-        )
-        candidate = find_first_matching_post(
-            posts,
-            local_today=today,
-            tz=tz,
-            keyword_1=keyword_1,
-            keyword_2=keyword_2,
-        )
-        if candidate is None:
-            LOG.info("No matching post for %s", today_string)
-            if newest_source_post_id and not is_dry_run:
-                save_state(
-                    state_path,
-                    {
-                        "date": today_string,
-                        "last_seen_source_post_id": newest_source_post_id,
-                    },
-                )
+        if already_posted:
+            LOG.info("Already posted today's message; target=@%s", target_username)
+
+        client: XClient | None = None
+        if should_check_followers and not is_dry_run:
+            client = XClient(
+                consumer_key,
+                consumer_secret,
+                access_token,
+                access_token_secret,
+                api_base_url,
+                bearer_token,
+            )
+            authenticated_user = client.get_authenticated_user()
+            target_user_id = str(authenticated_user["id"])
+            follow_new_followers(
+                client,
+                target_user_id=target_user_id,
+                today_string=today_string,
+                followers_path=followers_path,
+            )
+
+        if now.hour != 13:
+            if not already_posted:
+                LOG.info("Outside posting window (13:00-13:59); skipping daily post")
             return 0
 
-        candidate_id = str(candidate["id"])
-        candidate_text = candidate.get("text", "")
-        candidate_created_at = candidate["created_at"]
-        if not candidate_text:
-            LOG.warning("Candidate %s has no text; skipping", candidate_id)
+        if already_posted:
             return 0
 
-        LOG.info(
-            "Found first matching post %s at %s: %s",
-            candidate_id,
-            candidate_created_at,
-            candidate_text,
-        )
+        if client is None:
+            client = XClient(
+                consumer_key,
+                consumer_secret,
+                access_token,
+                access_token_secret,
+                api_base_url,
+                bearer_token,
+            )
         post_text = render_post_text(post_text_template, today)
         LOG.info("Post text: %s", post_text)
         if is_dry_run:
@@ -504,13 +463,11 @@ def run(config_path: Path, dry_run: bool = False) -> int:
             state_path,
             {
                 "date": today_string,
-                "source_post_id": candidate_id,
-                "source_created_at": candidate_created_at,
                 "target_post_id": target_post_id,
                 "posted_text": post_text,
             },
         )
-        LOG.info("Posted summary for source post %s to @%s as %s", candidate_id, target_username, target_post_id)
+        LOG.info("Posted daily message to @%s as %s", target_username, target_post_id)
         return 0
 
 

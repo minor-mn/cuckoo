@@ -6,23 +6,17 @@ consumer_key = ""
 consumer_secret = ""
 access_token = ""
 access_token_secret = ""
-
-[source]
-username = "source_account"
-# Optional: setting this avoids the username lookup on every run.
-user_id = ""
+# App bearer token, used for follower-list lookups.
+bearer_token = ""
 
 [target]
 username = "target_account"
 # Post text template. Supported date tokens are yyyy, mm, and dd.
 post_text = "yyyy.mm.dd Daily update"
 
-[matching]
-keyword_1 = "keyword_one"
-keyword_2 = "keyword_two"
-
 [system]
 timezone = "Asia/Tokyo"
 state_file = "state.json"
+followers_file = "followers.json"
 api_base_url = "https://api.x.com"
 dry_run = false
